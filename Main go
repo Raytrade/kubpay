@@ -1,0 +1,2355 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/sha512"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
+	"golang.org/x/crypto/bcrypt"
+)
+
+type App struct {
+	db *pgxpool.Pool
+}
+
+type Claims struct {
+	UserID string `json:"user_id"`
+	Role   string `json:"role"`
+	jwt.RegisteredClaims
+}
+
+type PaystackResponse map[string]any
+
+func main() {
+	_ = godotenv.Load()
+
+	ctx := context.Background()
+
+	databaseURL := mustEnv("DATABASE_URL")
+
+	db, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		log.Fatal("database connection failed: ", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(ctx); err != nil {
+		log.Fatal("database ping failed: ", err)
+	}
+
+	app := &App{
+		db: db,
+	}
+
+	router := gin.New()
+
+	router.Use(
+		gin.Logger(),
+		gin.Recovery(),
+	)
+
+	router.GET("/", func(c *gin.Context) {
+		c.File("./web/index.html")
+	})
+
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "ok",
+			"service": "kubpay",
+		})
+	})
+
+	router.GET("/ready", func(c *gin.Context) {
+		if err := app.db.Ping(c.Request.Context()); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"ready": false,
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"ready": true,
+		})
+	})
+
+	// Public authentication.
+	router.POST("/api/v1/auth/register", app.register)
+	router.POST("/api/v1/auth/login", app.login)
+
+	// Paystack webhook.
+	router.POST("/webhooks/paystack", app.paystackWebhook)
+
+	// Authenticated customer API.
+	api := router.Group("/api/v1")
+	api.Use(app.authMiddleware())
+
+	api.GET("/me", app.me)
+	api.GET("/balance", app.balance)
+
+	api.GET("/banks", app.banks)
+	api.GET("/resolve-account", app.resolveAccount)
+
+	api.POST("/payouts", app.createPayout)
+	api.GET("/payouts", app.listPayouts)
+
+	api.GET("/transactions", app.transactions)
+
+	// Founder/admin API.
+	admin := router.Group("/api/v1/admin")
+	admin.Use(
+		app.authMiddleware(),
+		requireAdmin,
+	)
+
+	admin.POST("/payouts/:id/approve", app.approvePayout)
+	admin.POST("/payouts/:id/reject", app.rejectPayout)
+
+	port := env("PORT", "8080")
+
+	log.Printf("KubPay listening on :%s", port)
+
+	if err := router.Run(":" + port); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// ------------------------------------------------------------
+// Environment helpers
+// ------------------------------------------------------------
+
+func env(key, fallback string) string {
+	value := os.Getenv(key)
+
+	if value == "" {
+		return fallback
+	}
+
+	return value
+}
+
+func mustEnv(key string) string {
+	value := os.Getenv(key)
+
+	if value == "" {
+		log.Fatalf("missing required environment variable: %s", key)
+	}
+
+	return value
+}
+
+func envInt64(key string, fallback int64) int64 {
+	value := os.Getenv(key)
+
+	if value == "" {
+		return fallback
+	}
+
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		log.Fatalf("invalid integer environment variable %s", key)
+	}
+
+	return n
+}
+
+// ------------------------------------------------------------
+// Authentication
+// ------------------------------------------------------------
+
+func (a *App) register(c *gin.Context) {
+	var input struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "invalid request",
+		})
+		return
+	}
+
+	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
+
+	if input.Email == "" || !strings.Contains(input.Email, "@") {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "valid email required",
+		})
+		return
+	}
+
+	if len(input.Password) < 8 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "password must contain at least 8 characters",
+		})
+		return
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword(
+		[]byte(input.Password),
+		bcrypt.DefaultCost,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "password processing failed",
+		})
+		return
+	}
+
+	tx, err := a.db.Begin(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "database error",
+		})
+		return
+	}
+
+	defer tx.Rollback(c.Request.Context())
+
+	var userID uuid.UUID
+
+	err = tx.QueryRow(
+		c.Request.Context(),
+		`
+		INSERT INTO users (
+			email,
+			password_hash
+		)
+		VALUES ($1,$2)
+		RETURNING id
+		`,
+		input.Email,
+		string(passwordHash),
+	).Scan(&userID)
+
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "email already registered",
+		})
+		return
+	}
+
+	_, err = tx.Exec(
+		c.Request.Context(),
+		`
+		INSERT INTO wallets (
+			user_id,
+			currency
+		)
+		VALUES ($1,'NGN')
+		`,
+		userID,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "wallet creation failed",
+		})
+		return
+	}
+
+	if err := tx.Commit(c.Request.Context()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "database commit failed",
+		})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"user_id": userID,
+	})
+}
+
+func (a *App) login(c *gin.Context) {
+	var input struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "invalid request",
+		})
+		return
+	}
+
+	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
+
+	var (
+		userID       uuid.UUID
+		role         string
+		passwordHash string
+	)
+
+	err := a.db.QueryRow(
+		c.Request.Context(),
+		`
+		SELECT
+			id,
+			role,
+			password_hash
+		FROM users
+		WHERE email=$1
+		`,
+		input.Email,
+	).Scan(
+		&userID,
+		&role,
+		&passwordHash,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "invalid credentials",
+		})
+		return
+	}
+
+	if bcrypt.CompareHashAndPassword(
+		[]byte(passwordHash),
+		[]byte(input.Password),
+	) != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "invalid credentials",
+		})
+		return
+	}
+
+	secret := mustEnv("JWT_SECRET")
+
+	now := time.Now()
+
+	token := jwt.NewWithClaims(
+		jwt.SigningMethodHS256,
+		Claims{
+			UserID: userID.String(),
+			Role:   role,
+			RegisteredClaims: jwt.RegisteredClaims{
+				IssuedAt: jwt.NewNumericDate(now),
+				ExpiresAt: jwt.NewNumericDate(
+					now.Add(24 * time.Hour),
+				),
+			},
+		},
+	)
+
+	signedToken, err := token.SignedString(
+		[]byte(secret),
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "token creation failed",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"token": signedToken,
+	})
+}
+
+func (a *App) authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		header := c.GetHeader("Authorization")
+
+		if !strings.HasPrefix(header, "Bearer ") {
+			c.AbortWithStatusJSON(
+				http.StatusUnauthorized,
+				gin.H{
+					"error": "missing bearer token",
+				},
+			)
+			return
+		}
+
+		tokenString := strings.TrimPrefix(
+			header,
+			"Bearer ",
+		)
+
+		token, err := jwt.ParseWithClaims(
+			tokenString,
+			&Claims{},
+			func(token *jwt.Token) (any, error) {
+				if token.Method != jwt.SigningMethodHS256 {
+					return nil, errors.New(
+						"invalid signing method",
+					)
+				}
+
+				return []byte(mustEnv("JWT_SECRET")), nil
+			},
+		)
+
+		if err != nil || !token.Valid {
+			c.AbortWithStatusJSON(
+				http.StatusUnauthorized,
+				gin.H{
+					"error": "invalid or expired token",
+				},
+			)
+			return
+		}
+
+		claims, ok := token.Claims.(*Claims)
+
+		if !ok {
+			c.AbortWithStatusJSON(
+				http.StatusUnauthorized,
+				gin.H{
+					"error": "invalid token claims",
+				},
+			)
+			return
+		}
+
+		c.Set("user_id", claims.UserID)
+		c.Set("role", claims.Role)
+
+		c.Next()
+	}
+}
+
+func requireAdmin(c *gin.Context) {
+	role, exists := c.Get("role")
+
+	if !exists {
+		c.AbortWithStatusJSON(
+			http.StatusForbidden,
+			gin.H{
+				"error": "administrator access required",
+			},
+		)
+		return
+	}
+
+	roleString, ok := role.(string)
+
+	if !ok {
+		c.AbortWithStatusJSON(
+			http.StatusForbidden,
+			gin.H{
+				"error": "administrator access required",
+			},
+		)
+		return
+	}
+
+	if roleString != "admin" && roleString != "founder" {
+		c.AbortWithStatusJSON(
+			http.StatusForbidden,
+			gin.H{
+				"error": "administrator access required",
+			},
+		)
+		return
+	}
+
+	c.Next()
+}
+
+func currentUserID(c *gin.Context) (uuid.UUID, error) {
+	value := c.GetString("user_id")
+
+	return uuid.Parse(value)
+}
+
+// ------------------------------------------------------------
+// User / wallet
+// ------------------------------------------------------------
+
+func (a *App) me(c *gin.Context) {
+	userID, err := currentUserID(c)
+
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "invalid user",
+		})
+		return
+	}
+
+	var (
+		email string
+		role  string
+	)
+
+	err = a.db.QueryRow(
+		c.Request.Context(),
+		`
+		SELECT email, role
+		FROM users
+		WHERE id=$1
+		`,
+		userID,
+	).Scan(
+		&email,
+		&role,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "user not found",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":    userID,
+		"email": email,
+		"role":  role,
+	})
+}
+
+func (a *App) balance(c *gin.Context) {
+	userID, err := currentUserID(c)
+
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "invalid user",
+		})
+		return
+	}
+
+	var (
+		available int64
+		reserved  int64
+		currency  string
+	)
+
+	err = a.db.QueryRow(
+		c.Request.Context(),
+		`
+		SELECT
+			available_kobo,
+			reserved_kobo,
+			currency
+		FROM wallets
+		WHERE user_id=$1
+		`,
+		userID,
+	).Scan(
+		&available,
+		&reserved,
+		&currency,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "wallet not found",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"currency":       currency,
+		"available_kobo": available,
+		"reserved_kobo":  reserved,
+	})
+}
+
+// ------------------------------------------------------------
+// Paystack HTTP client
+// ------------------------------------------------------------
+
+func (a *App) paystackRequest(
+	ctx context.Context,
+	method string,
+	path string,
+	body any,
+) (PaystackResponse, int, error) {
+
+	baseURL := strings.TrimRight(
+		env(
+			"PAYSTACK_BASE_URL",
+			"https://api.paystack.co",
+		),
+		"/",
+	)
+
+	var requestBody io.Reader
+
+	if body != nil {
+		raw, err := json.Marshal(body)
+
+		if err != nil {
+			return nil, 0, err
+		}
+
+		requestBody = bytes.NewReader(raw)
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		method,
+		baseURL+path,
+		requestBody,
+	)
+
+	if err != nil {
+		return nil, 0, err
+	}
+
+	req.Header.Set(
+		"Authorization",
+		"Bearer "+mustEnv("PAYSTACK_SECRET_KEY"),
+	)
+
+	req.Header.Set(
+		"Content-Type",
+		"application/json",
+	)
+
+	client := &http.Client{
+		Timeout: 20 * time.Second,
+	}
+
+	response, err := client.Do(req)
+
+	if err != nil {
+		return nil, 0, err
+	}
+
+	defer response.Body.Close()
+
+	raw, err := io.ReadAll(
+		io.LimitReader(
+			response.Body,
+			4<<20,
+		),
+	)
+
+	if err != nil {
+		return nil, response.StatusCode, err
+	}
+
+	var result PaystackResponse
+
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &result); err != nil {
+			return nil,
+				response.StatusCode,
+				fmt.Errorf(
+					"invalid provider response: %s",
+					string(raw),
+				)
+		}
+	}
+
+	if response.StatusCode < 200 ||
+		response.StatusCode >= 300 {
+
+		return result,
+			response.StatusCode,
+			fmt.Errorf(
+				"paystack returned HTTP %d",
+				response.StatusCode,
+			)
+	}
+
+	ok, _ := result["status"].(bool)
+
+	if !ok {
+		return result,
+			response.StatusCode,
+			errors.New(
+				"paystack returned unsuccessful status",
+			)
+	}
+
+	return result,
+		response.StatusCode,
+		nil
+}
+
+// ------------------------------------------------------------
+// Banks
+// ------------------------------------------------------------
+
+func (a *App) banks(c *gin.Context) {
+	result, _, err := a.paystackRequest(
+		c.Request.Context(),
+		http.MethodGet,
+		"/bank?country=nigeria&currency=NGN",
+		nil,
+	)
+
+	if err != nil {
+		c.JSON(
+			http.StatusBadGateway,
+			gin.H{
+				"error":    "bank list unavailable",
+				"provider": result,
+			},
+		)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// ------------------------------------------------------------
+// Account name resolution
+// ------------------------------------------------------------
+
+func (a *App) resolveAccount(c *gin.Context) {
+	bankCode := strings.TrimSpace(
+		c.Query("bank_code"),
+	)
+
+	accountNumber := strings.TrimSpace(
+		c.Query("account_number"),
+	)
+
+	if bankCode == "" ||
+		len(accountNumber) != 10 {
+
+		c.JSON(
+			http.StatusBadRequest,
+			gin.H{
+				"error":
+					"bank_code and 10-digit account_number required",
+			},
+		)
+		return
+	}
+
+	query := url.Values{}
+
+	query.Set(
+		"account_number",
+		accountNumber,
+	)
+
+	query.Set(
+		"bank_code",
+		bankCode,
+	)
+
+	result, _, err := a.paystackRequest(
+		c.Request.Context(),
+		http.MethodGet,
+		"/bank/resolve?"+query.Encode(),
+		nil,
+	)
+
+	if err != nil {
+		c.JSON(
+			http.StatusUnprocessableEntity,
+			gin.H{
+				"error":
+					"account could not be resolved",
+				"provider": result,
+			},
+		)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// ------------------------------------------------------------
+// Payout creation
+// ------------------------------------------------------------
+
+type payoutRequest struct {
+	BankCode      string `json:"bank_code"`
+	AccountNumber string `json:"account_number"`
+	AmountKobo    int64  `json:"amount_kobo"`
+	Reason        string `json:"reason"`
+}
+
+func (a *App) createPayout(c *gin.Context) {
+	userID, err := currentUserID(c)
+
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "invalid user",
+		})
+		return
+	}
+
+	var input payoutRequest
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "invalid payout request",
+		})
+		return
+	}
+
+	input.BankCode = strings.TrimSpace(
+		input.BankCode,
+	)
+
+	input.AccountNumber = strings.TrimSpace(
+		input.AccountNumber,
+	)
+
+	if input.BankCode == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "bank_code is required",
+		})
+		return
+	}
+
+	if len(input.AccountNumber) != 10 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "account number must contain 10 digits",
+		})
+		return
+	}
+
+	if input.AmountKobo <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "amount_kobo must be greater than zero",
+		})
+		return
+	}
+
+	maxSingle := envInt64(
+		"MAX_SINGLE_TRANSFER_KOBO",
+		5_000_000,
+	)
+
+	if input.AmountKobo > maxSingle {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "single transfer limit exceeded",
+		})
+		return
+	}
+
+	idempotencyKey := strings.TrimSpace(
+		c.GetHeader("Idempotency-Key"),
+	)
+
+	if idempotencyKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Idempotency-Key header required",
+		})
+		return
+	}
+
+	// Resolve the account first.
+	query := url.Values{}
+
+	query.Set(
+		"account_number",
+		input.AccountNumber,
+	)
+
+	query.Set(
+		"bank_code",
+		input.BankCode,
+	)
+
+	resolved, _, err := a.paystackRequest(
+		c.Request.Context(),
+		http.MethodGet,
+		"/bank/resolve?"+query.Encode(),
+		nil,
+	)
+
+	if err != nil {
+		c.JSON(
+			http.StatusUnprocessableEntity,
+			gin.H{
+				"error":
+					"account resolution failed",
+				"provider": resolved,
+			},
+		)
+		return
+	}
+
+	data, ok := resolved["data"].(map[string]any)
+
+	if !ok {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "provider returned invalid account data",
+		})
+		return
+	}
+
+	accountName, ok := data["account_name"].(string)
+
+	if !ok || strings.TrimSpace(accountName) == "" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "provider did not return account name",
+		})
+		return
+	}
+
+	accountName = strings.TrimSpace(accountName)
+
+	// Hash the actual server-verified request.
+	hashInput := fmt.Sprintf(
+		"%s|%s|%s|%d|%s",
+		input.BankCode,
+		input.AccountNumber,
+		accountName,
+		input.AmountKobo,
+		input.Reason,
+	)
+
+	hash := sha256.Sum256(
+		[]byte(hashInput),
+	)
+
+	requestHash := hex.EncodeToString(
+		hash[:],
+	)
+
+	tx, err := a.db.Begin(
+		c.Request.Context(),
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "database transaction failed",
+		})
+		return
+	}
+
+	defer tx.Rollback(
+		c.Request.Context(),
+	)
+
+	// Idempotency check.
+	var (
+		oldHash string
+		oldCode int
+		oldBody []byte
+	)
+
+	err = tx.QueryRow(
+		c.Request.Context(),
+		`
+		SELECT
+			request_hash,
+			response_code,
+			response_body
+		FROM idempotency_keys
+		WHERE user_id=$1
+		  AND key=$2
+		`,
+		userID,
+		idempotencyKey,
+	).Scan(
+		&oldHash,
+		&oldCode,
+		&oldBody,
+	)
+
+	if err == nil {
+		if oldHash != requestHash {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":
+					"Idempotency-Key already used with different request",
+			})
+			return
+		}
+
+		c.Data(
+			oldCode,
+			"application/json",
+			oldBody,
+		)
+
+		return
+	}
+
+	if !errors.Is(err, pgx.ErrNoRows) {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "idempotency lookup failed",
+		})
+		return
+	}
+
+	// Lock this user's day to prevent concurrent requests
+	// bypassing the daily limit.
+	_, err = tx.Exec(
+		c.Request.Context(),
+		`
+		SELECT pg_advisory_xact_lock(
+			hashtext($1)
+		)
+		`,
+		userID.String()+"|"+
+			time.Now().UTC().Format("2006-01-02"),
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "daily limit lock failed",
+		})
+		return
+	}
+
+	var available int64
+
+	err = tx.QueryRow(
+		c.Request.Context(),
+		`
+		SELECT available_kobo
+		FROM wallets
+		WHERE user_id=$1
+		FOR UPDATE
+		`,
+		userID,
+	).Scan(&available)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "wallet not found",
+		})
+		return
+	}
+
+	var todayTotal int64
+
+	err = tx.QueryRow(
+		c.Request.Context(),
+		`
+		SELECT COALESCE(
+			SUM(amount_kobo),
+			0
+		)
+		FROM payouts
+		WHERE user_id=$1
+		  AND created_at >= date_trunc(
+		      'day',
+		      now()
+		  )
+		  AND status NOT IN (
+		      'FAILED',
+		      'REVERSED'
+		  )
+		`,
+		userID,
+	).Scan(&todayTotal)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "daily limit calculation failed",
+		})
+		return
+	}
+
+	dailyLimit := envInt64(
+		"DAILY_TRANSFER_LIMIT_KOBO",
+		5_000_000_000,
+	)
+
+	if todayTotal+input.AmountKobo > dailyLimit {
+		c.JSON(
+			http.StatusUnprocessableEntity,
+			gin.H{
+				"error":
+					"daily transfer limit exceeded",
+			},
+		)
+		return
+	}
+
+	if available < input.AmountKobo {
+		c.JSON(
+			http.StatusUnprocessableEntity,
+			gin.H{
+				"error":
+					"insufficient available balance",
+			},
+		)
+		return
+	}
+
+	reference :=
+		"kubpay-" +
+			strings.ReplaceAll(
+				uuid.NewString(),
+				"-",
+				"",
+			)
+
+	approvalStatus := "NOT_REQUIRED"
+	status := "PROCESSING"
+
+	if strings.EqualFold(
+		env(
+			"PAYOUT_REQUIRE_APPROVAL",
+			"true",
+		),
+		"true",
+	) {
+		approvalStatus = "PENDING"
+		status = "PENDING_APPROVAL"
+	}
+
+	// Reserve customer funds.
+	_, err = tx.Exec(
+		c.Request.Context(),
+		`
+		UPDATE wallets
+		SET
+			available_kobo =
+				available_kobo - $1,
+			reserved_kobo =
+				reserved_kobo + $1,
+			updated_at = now()
+		WHERE user_id=$2
+		  AND available_kobo >= $1
+		`,
+		input.AmountKobo,
+		userID,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "fund reservation failed",
+		})
+		return
+	}
+
+	var payoutID uuid.UUID
+
+	err = tx.QueryRow(
+		c.Request.Context(),
+		`
+		INSERT INTO payouts (
+			user_id,
+			reference,
+			account_number,
+			bank_code,
+			account_name,
+			amount_kobo,
+			status,
+			approval_status
+		)
+		VALUES (
+			$1,$2,$3,$4,$5,$6,$7,$8
+		)
+		RETURNING id
+		`,
+		userID,
+		reference,
+		input.AccountNumber,
+		input.BankCode,
+		accountName,
+		input.AmountKobo,
+		status,
+		approvalStatus,
+	).Scan(&payoutID)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "payout creation failed",
+		})
+		return
+	}
+
+	response := gin.H{
+		"id":             payoutID,
+		"reference":      reference,
+		"status":         status,
+		"approval_status": approvalStatus,
+		"account_name":   accountName,
+		"amount_kobo":    input.AmountKobo,
+		"currency":       "NGN",
+	}
+
+	responseBody, err := json.Marshal(response)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "response creation failed",
+		})
+		return
+	}
+
+	_, err = tx.Exec(
+		c.Request.Context(),
+		`
+		INSERT INTO idempotency_keys (
+			user_id,
+			key,
+			request_hash,
+			response_code,
+			response_body
+		)
+		VALUES ($1,$2,$3,$4,$5)
+		`,
+		userID,
+		idempotencyKey,
+		requestHash,
+		http.StatusCreated,
+		responseBody,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "idempotency record failed",
+		})
+		return
+	}
+
+	_, _ = tx.Exec(
+		c.Request.Context(),
+		`
+		INSERT INTO audit_logs (
+			actor_user_id,
+			action,
+			entity_type,
+			entity_id,
+			details
+		)
+		VALUES (
+			$1,
+			'payout.created',
+			'payout',
+			$2,
+			$3
+		)
+		`,
+		userID,
+		payoutID.String(),
+		responseBody,
+	)
+
+	if err := tx.Commit(
+		c.Request.Context(),
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "database commit failed",
+		})
+		return
+	}
+
+	// Only execute immediately when approval is not required.
+	if status == "PROCESSING" {
+		if err := a.executePayout(
+			c.Request.Context(),
+			payoutID,
+		); err != nil {
+			log.Printf(
+				"payout execution returned: %v",
+				err,
+			)
+		}
+	}
+
+	c.Data(
+		http.StatusCreated,
+		"application/json",
+		responseBody,
+	)
+}
+
+// ------------------------------------------------------------
+// Execute Paystack transfer
+// ------------------------------------------------------------
+
+func (a *App) executePayout(
+	ctx context.Context,
+	payoutID uuid.UUID,
+) error {
+
+	tx, err := a.db.Begin(ctx)
+
+	if err != nil {
+		return err
+	}
+
+	defer tx.Rollback(ctx)
+
+	var (
+		reference     string
+		accountNumber string
+		bankCode      string
+		accountName   string
+		amount        int64
+		status        string
+	)
+
+	err = tx.QueryRow(
+		ctx,
+		`
+		SELECT
+			reference,
+			account_number,
+			bank_code,
+			account_name,
+			amount_kobo,
+			status
+		FROM payouts
+		WHERE id=$1
+		FOR UPDATE
+		`,
+		payoutID,
+	).Scan(
+		&reference,
+		&accountNumber,
+		&bankCode,
+		&accountName,
+		&amount,
+		&status,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	if status != "PROCESSING" {
+		return nil
+	}
+
+	// Create Paystack transfer recipient.
+	recipientResponse, _, err :=
+		a.paystackRequest(
+			ctx,
+			http.MethodPost,
+			"/transferrecipient",
+			map[string]any{
+				"type":           "nuban",
+				"name":           accountName,
+				"account_number": accountNumber,
+				"bank_code":      bankCode,
+				"currency":       "NGN",
+			},
+		)
+
+	if err != nil {
+		// We don't know whether the provider accepted
+		// anything. Keep funds reserved and mark UNKNOWN.
+		_, _ = tx.Exec(
+			ctx,
+			`
+			UPDATE payouts
+			SET
+				status='UNKNOWN',
+				failure_reason=$1,
+				updated_at=now()
+			WHERE id=$2
+			`,
+			err.Error(),
+			payoutID,
+		)
+
+		_ = tx.Commit(ctx)
+
+		return err
+	}
+
+	recipientData, ok :=
+		recipientResponse["data"].(map[string]any)
+
+	if !ok {
+		return errors.New(
+			"paystack recipient response missing data",
+		)
+	}
+
+	recipientCode, ok :=
+		recipientData["recipient_code"].(string)
+
+	if !ok || recipientCode == "" {
+		return errors.New(
+			"paystack recipient_code missing",
+		)
+	}
+
+	// Initiate transfer.
+	transferResponse, _, err :=
+		a.paystackRequest(
+			ctx,
+			http.MethodPost,
+			"/transfer",
+			map[string]any{
+				"source":    "balance",
+				"amount":    amount,
+				"recipient": recipientCode,
+				"reference": reference,
+				"reason":    nonEmptyReason("KubPay transfer"),
+				"currency":  "NGN",
+			},
+		)
+
+	if err != nil {
+		_, _ = tx.Exec(
+			ctx,
+			`
+			UPDATE payouts
+			SET
+				recipient_code=$1,
+				status='UNKNOWN',
+				provider_response=$2,
+				failure_reason=$3,
+				updated_at=now()
+			WHERE id=$4
+			`,
+			recipientCode,
+			mustJSON(transferResponse),
+			err.Error(),
+			payoutID,
+		)
+
+		_ = tx.Commit(ctx)
+
+		return err
+	}
+
+	providerStatus :=
+		providerTransferStatus(
+			transferResponse,
+		)
+
+	_, err = tx.Exec(
+		ctx,
+		`
+		UPDATE payouts
+		SET
+			recipient_code=$1,
+			status='PROCESSING',
+			provider_status=$2,
+			provider_response=$3,
+			updated_at=now()
+		WHERE id=$4
+		`,
+		recipientCode,
+		providerStatus,
+		mustJSON(transferResponse),
+		payoutID,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	_, _ = tx.Exec(
+		ctx,
+		`
+		INSERT INTO audit_logs (
+			action,
+			entity_type,
+			entity_id,
+			details
+		)
+		VALUES (
+			'payout.provider_submitted',
+			'payout',
+			$1,
+			$2
+		)
+		`,
+		payoutID.String(),
+		mustJSON(transferResponse),
+	)
+
+	return tx.Commit(ctx)
+}
+
+// ------------------------------------------------------------
+// Payout listing
+// ------------------------------------------------------------
+
+func (a *App) listPayouts(c *gin.Context) {
+	userID, err := currentUserID(c)
+
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "invalid user",
+		})
+		return
+	}
+
+	rows, err := a.db.Query(
+		c.Request.Context(),
+		`
+		SELECT
+			id,
+			reference,
+			account_number,
+			bank_code,
+			account_name,
+			amount_kobo,
+			status,
+			approval_status,
+			created_at,
+			updated_at
+		FROM payouts
+		WHERE user_id=$1
+		ORDER BY created_at DESC
+		LIMIT 100
+		`,
+		userID,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "database error",
+		})
+		return
+	}
+
+	defer rows.Close()
+
+	type payoutView struct {
+		ID             uuid.UUID `json:"id"`
+		Reference      string    `json:"reference"`
+		AccountNumber  string    `json:"account_number"`
+		BankCode       string    `json:"bank_code"`
+		AccountName    string    `json:"account_name"`
+		AmountKobo     int64     `json:"amount_kobo"`
+		Status         string    `json:"status"`
+		ApprovalStatus string    `json:"approval_status"`
+		CreatedAt      time.Time `json:"created_at"`
+		UpdatedAt      time.Time `json:"updated_at"`
+	}
+
+	result := make(
+		[]payoutView,
+		0,
+	)
+
+	for rows.Next() {
+		var item payoutView
+
+		if err := rows.Scan(
+			&item.ID,
+			&item.Reference,
+			&item.AccountNumber,
+			&item.BankCode,
+			&item.AccountName,
+			&item.AmountKobo,
+			&item.Status,
+			&item.ApprovalStatus,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+		); err != nil {
+			continue
+		}
+
+		result = append(
+			result,
+			item,
+		)
+	}
+
+	c.JSON(
+		http.StatusOK,
+		result,
+	)
+}
+
+// ------------------------------------------------------------
+// Ledger transactions
+// ------------------------------------------------------------
+
+func (a *App) transactions(c *gin.Context) {
+	userID, err := currentUserID(c)
+
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "invalid user",
+		})
+		return
+	}
+
+	rows, err := a.db.Query(
+		c.Request.Context(),
+		`
+		SELECT
+			id,
+			kind,
+			amount_kobo,
+			reference,
+			created_at
+		FROM ledger_entries
+		WHERE user_id=$1
+		ORDER BY created_at DESC
+		LIMIT 100
+		`,
+		userID,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "database error",
+		})
+		return
+	}
+
+	defer rows.Close()
+
+	type transactionView struct {
+		ID         uuid.UUID `json:"id"`
+		Kind       string    `json:"kind"`
+		AmountKobo int64     `json:"amount_kobo"`
+		Reference  string    `json:"reference"`
+		CreatedAt  time.Time `json:"created_at"`
+	}
+
+	result := make(
+		[]transactionView,
+		0,
+	)
+
+	for rows.Next() {
+		var item transactionView
+
+		if err := rows.Scan(
+			&item.ID,
+			&item.Kind,
+			&item.AmountKobo,
+			&item.Reference,
+			&item.CreatedAt,
+		); err != nil {
+			continue
+		}
+
+		result = append(
+			result,
+			item,
+		)
+	}
+
+	c.JSON(
+		http.StatusOK,
+		result,
+	)
+}
+
+// ------------------------------------------------------------
+// Founder approval
+// ------------------------------------------------------------
+
+func (a *App) approvePayout(c *gin.Context) {
+	payoutID, err := uuid.Parse(
+		c.Param("id"),
+	)
+
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "invalid payout id",
+		})
+		return
+	}
+
+	tx, err := a.db.Begin(
+		c.Request.Context(),
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "database error",
+		})
+		return
+	}
+
+	defer tx.Rollback(
+		c.Request.Context(),
+	)
+
+	var status string
+
+	err = tx.QueryRow(
+		c.Request.Context(),
+		`
+		SELECT status
+		FROM payouts
+		WHERE id=$1
+		FOR UPDATE
+		`,
+		payoutID,
+	).Scan(&status)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "payout not found",
+		})
+		return
+	}
+
+	if status != "PENDING_APPROVAL" {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "payout is not awaiting approval",
+		})
+		return
+	}
+
+	_, err = tx.Exec(
+		c.Request.Context(),
+		`
+		UPDATE payouts
+		SET
+			approval_status='APPROVED',
+			status='PROCESSING',
+			updated_at=now()
+		WHERE id=$1
+		`,
+		payoutID,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "approval failed",
+		})
+		return
+	}
+
+	actorID, _ := currentUserID(c)
+
+	_, _ = tx.Exec(
+		c.Request.Context(),
+		`
+		INSERT INTO audit_logs (
+			actor_user_id,
+			action,
+			entity_type,
+			entity_id
+		)
+		VALUES (
+			$1,
+			'payout.approved',
+			'payout',
+			$2
+		)
+		`,
+		actorID,
+		payoutID.String(),
+	)
+
+	if err := tx.Commit(
+		c.Request.Context(),
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "commit failed",
+		})
+		return
+	}
+
+	if err := a.executePayout(
+		c.Request.Context(),
+		payoutID,
+	); err != nil {
+		c.JSON(
+			http.StatusAccepted,
+			gin.H{
+				"status": "PROCESSING",
+				"warning":
+					"provider execution deferred",
+			},
+		)
+		return
+	}
+
+	c.JSON(
+		http.StatusOK,
+		gin.H{
+			"status": "PROCESSING",
+		},
+	)
+}
+
+func (a *App) rejectPayout(c *gin.Context) {
+	payoutID, err := uuid.Parse(
+		c.Param("id"),
+	)
+
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "invalid payout id",
+		})
+		return
+	}
+
+	tx, err := a.db.Begin(
+		c.Request.Context(),
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "database error",
+		})
+		return
+	}
+
+	defer tx.Rollback(
+		c.Request.Context(),
+	)
+
+	var (
+		userID uuid.UUID
+		amount int64
+		status string
+	)
+
+	err = tx.QueryRow(
+		c.Request.Context(),
+		`
+		SELECT
+			user_id,
+			amount_kobo,
+			status
+		FROM payouts
+		WHERE id=$1
+		FOR UPDATE
+		`,
+		payoutID,
+	).Scan(
+		&userID,
+		&amount,
+		&status,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "payout not found",
+		})
+		return
+	}
+
+	if status != "PENDING_APPROVAL" {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "payout is not pending approval",
+		})
+		return
+	}
+
+	_, err = tx.Exec(
+		c.Request.Context(),
+		`
+		UPDATE payouts
+		SET
+			status='FAILED',
+			approval_status='REJECTED',
+			failure_reason='rejected by administrator',
+			updated_at=now()
+		WHERE id=$1
+		`,
+		payoutID,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "rejection failed",
+		})
+		return
+	}
+
+	// Release the reservation.
+	_, err = tx.Exec(
+		c.Request.Context(),
+		`
+		UPDATE wallets
+		SET
+			reserved_kobo =
+				reserved_kobo - $1,
+			available_kobo =
+				available_kobo + $1,
+			updated_at=now()
+		WHERE user_id=$2
+		`,
+		amount,
+		userID,
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "fund release failed",
+		})
+		return
+	}
+
+	actorID, _ := currentUserID(c)
+
+	_, _ = tx.Exec(
+		c.Request.Context(),
+		`
+		INSERT INTO audit_logs (
+			actor_user_id,
+			action,
+			entity_type,
+			entity_id
+		)
+		VALUES (
+			$1,
+			'payout.rejected',
+			'payout',
+			$2
+		)
+		`,
+		actorID,
+		payoutID.String(),
+	)
+
+	if err := tx.Commit(
+		c.Request.Context(),
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "commit failed",
+		})
+		return
+	}
+
+	c.JSON(
+		http.StatusOK,
+		gin.H{
+			"status": "FAILED",
+		},
+	)
+}
+
+// ------------------------------------------------------------
+// Paystack webhook
+// ------------------------------------------------------------
+
+func (a *App) paystackWebhook(c *gin.Context) {
+	rawBody, err := io.ReadAll(
+		io.LimitReader(
+			c.Request.Body,
+			4<<20,
+		),
+	)
+
+	if err != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+
+	signature :=
+		strings.TrimSpace(
+			c.GetHeader(
+				"x-paystack-signature",
+			),
+		)
+
+	expectedMAC := hmac.New(
+		sha512.New,
+		[]byte(mustEnv("PAYSTACK_SECRET_KEY")),
+	)
+
+	_, _ = expectedMAC.Write(rawBody)
+
+	expectedSignature :=
+		hex.EncodeToString(
+			expectedMAC.Sum(nil),
+		)
+
+	if subtle.ConstantTimeCompare(
+		[]byte(strings.ToLower(signature)),
+		[]byte(strings.ToLower(expectedSignature)),
+	) != 1 {
+		c.Status(http.StatusUnauthorized)
+		return
+	}
+
+	var event struct {
+		Event string `json:"event"`
+		Data  struct {
+			Reference string `json:"reference"`
+			Status    string `json:"status"`
+			Amount    int64  `json:"amount"`
+			ID        int64  `json:"id"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(
+		rawBody,
+		&event,
+	); err != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+
+	if event.Event != "transfer.success" &&
+		event.Event != "transfer.failed" &&
+		event.Event != "transfer.reversed" {
+
+		// Valid Paystack event, but not a transfer event
+		// handled by KubPay.
+		c.Status(http.StatusOK)
+		return
+	}
+
+	reference := strings.TrimSpace(
+		event.Data.Reference,
+	)
+
+	if reference == "" {
+		c.Status(http.StatusOK)
+		return
+	}
+
+	eventID := fmt.Sprintf(
+		"%s:%s:%d:%d",
+		event.Event,
+		reference,
+		event.Data.ID,
+		event.Data.Amount,
+	)
+
+	tx, err := a.db.Begin(
+		c.Request.Context(),
+	)
+
+	if err != nil {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+
+	defer tx.Rollback(
+		c.Request.Context(),
+	)
+
+	// Deduplicate webhook delivery.
+	var inserted bool
+
+	err = tx.QueryRow(
+		c.Request.Context(),
+		`
+		INSERT INTO webhook_events (
+			event_id,
+			event_type,
+			payload
+		)
+		VALUES ($1,$2,$3)
+		ON CONFLICT (event_id)
+		DO NOTHING
+		RETURNING true
+		`,
+		eventID,
+		event.Event,
+		rawBody,
+	).Scan(&inserted)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Already processed.
+		_ = tx.Commit(
+			c.Request.Context(),
+		)
+		c.Status(http.StatusOK)
+		return
+	}
+
+	if err != nil {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+
+	var (
+		payoutID uuid.UUID
+		userID   uuid.UUID
+		amount   int64
+		status   string
+	)
+
+	err = tx.QueryRow(
+		c.Request.Context(),
+		`
+		SELECT
+			id,
+			user_id,
+			amount_kobo,
+			status
+		FROM payouts
+		WHERE reference=$1
+		FOR UPDATE
+		`,
+		reference,
+	).Scan(
+		&payoutID,
+		&userID,
+		&amount,
+		&status,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Do not fail the webhook simply because the
+		// reference isn't one of our payouts.
+		_ = tx.Commit(
+			c.Request.Context(),
+		)
+
+		c.Status(http.StatusOK)
+		return
+	}
+
+	if err != nil {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+
+	// Verify provider amount when supplied.
+	if event.Data.Amount > 0 &&
+		event.Data.Amount != amount {
+
+		_, _ = tx.Exec(
+			c.Request.Context(),
+			`
+			UPDATE payouts
+			SET
+				status='UNKNOWN',
+				failure_reason=$1,
+				updated_at=now()
+			WHERE id=$2
+			`,
+			"provider amount does not match payout amount",
+			payoutID,
+		)
+
+		_ = tx.Commit(
+			c.Request.Context(),
+		)
+
+		c.Status(http.StatusOK)
+		return
+	}
+
+	// Never settle an already-final payout twice.
+	if status == "SUCCESS" ||
+		status == "FAILED" ||
+		status == "REVERSED" {
+
+		_ = tx.Commit(
+			c.Request.Context(),
+		)
+
+		c.Status(http.StatusOK)
+		return
+	}
+
+	switch event.Event {
+
+	case "transfer.success":
+
+		_, err = tx.Exec(
+			c.Request.Context(),
+			`
+			UPDATE payouts
+			SET
+				status='SUCCESS',
+				provider_status='success',
+				provider_response=$1,
+				updated_at=now()
+			WHERE id=$2
+			`,
+			rawBody,
+			payoutID,
+		)
+
+		if err == nil {
+			_, err = tx.Exec(
+				c.Request.Context(),
+				`
+				UPDATE wallets
+				SET
+					reserved_kobo =
+						reserved_kobo - $1,
+					updated_at=now()
+				WHERE user_id=$2
+				  AND reserved_kobo >= $1
+				`,
+				amount,
+				userID,
+			)
+		}
+
+		if err == nil {
+			_, err = tx.Exec(
+				c.Request.Context(),
+				`
+				INSERT INTO ledger_entries (
+					user_id,
+					kind,
+					amount_kobo,
+					reference
+				)
+				VALUES (
+					$1,
+					'PAYOUT_DEBIT',
+					$2,
+					$3
+				)
+				`,
+				userID,
+				-amount,
+				reference,
+			)
+		}
+
+	case "transfer.failed":
+
+		_, err = tx.Exec(
+			c.Request.Context(),
+			`
+			UPDATE payouts
+			SET
+				status='FAILED',
+				provider_status='failed',
+				provider_response=$1,
+				updated_at=now()
+			WHERE id=$2
+			`,
+			rawBody,
+			payoutID,
+		)
+
+		if err == nil {
+			_, err = tx.Exec(
+				c.Request.Context(),
+				`
+				UPDATE wallets
+				SET
+					reserved_kobo =
+						reserved_kobo - $1,
+					available_kobo =
+						available_kobo + $1,
+					updated_at=now()
+				WHERE user_id=$2
+				  AND reserved_kobo >= $1
+				`,
+				amount,
+				userID,
+			)
+		}
+
+	case "transfer.reversed":
+
+		_, err = tx.Exec(
+			c.Request.Context(),
+			`
+			UPDATE payouts
+			SET
+				status='REVERSED',
+				provider_status='reversed',
+				provider_response=$1,
+				updated_at=now()
+			WHERE id=$2
+			`,
+			rawBody,
+			payoutID,
+		)
+
+		if err == nil {
+			_, err = tx.Exec(
+				c.Request.Context(),
+				`
+				UPDATE wallets
+				SET
+					reserved_kobo =
+						reserved_kobo - $1,
+					available_kobo =
+						available_kobo + $1,
+					updated_at=now()
+				WHERE user_id=$2
+				  AND reserved_kobo >= $1
+				`,
+				amount,
+				userID,
+			)
+		}
+	}
+
+	if err != nil {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+
+	_, _ = tx.Exec(
+		c.Request.Context(),
+		`
+		INSERT INTO audit_logs (
+			action,
+			entity_type,
+			entity_id,
+			details
+		)
+		VALUES (
+			'payout.webhook_processed',
+			'payout',
+			$1,
+			$2
+		)
+		`,
+		payoutID.String(),
+		rawBody,
+	)
+
+	if err := tx.Commit(
+		c.Request.Context(),
+	); err != nil {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+
+	c.Status(http.StatusOK)
+}
+
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
+
+func providerTransferStatus(
+	response PaystackResponse,
+) string {
+
+	data, ok :=
+		response["data"].(map[string]any)
+
+	if !ok {
+		return ""
+	}
+
+	status, _ :=
+		data["status"].(string)
+
+	return status
+}
+
+func nonEmptyReason(
+	value string,
+) string {
+
+	value = strings.TrimSpace(value)
+
+	if value == "" {
+		return "KubPay transfer"
+	}
+
+	return value
+}
+
+func mustJSON(
+	value any,
+) []byte {
+
+	data, err := json.Marshal(value)
+
+	if err != nil {
+		return []byte(`{}`)
+	}
+
+	return data
+}
