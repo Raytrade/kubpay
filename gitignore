@@ -1,4 +1,30 @@
+# Environment / secrets
 .env
+.env.*
+!.env.example
+
+# Go
+/bin/
+/dist/
+/build/
+*.test
+*.out
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local databases / backups
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+
+# Logs
 *.log
-kubpay-server
-coverage.out
+
+# Temporary files
+tmp/
+temp/
