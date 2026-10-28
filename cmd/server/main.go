@@ -1484,6 +1484,16 @@ func (a *App) settleSuccessfulPayout(
 	return tx.Commit()
 }
 
+func payoutFailureAction(status, event string) string {
+	if status == "SUCCESS" && event == "transfer.reversed" {
+		return "CREDIT_REVERSAL"
+	}
+	if status == "SUCCESS" || status == "FAILED" || status == "REVERSED" {
+		return "NOOP"
+	}
+	return "RELEASE_RESERVED"
+}
+
 func (a *App) failPayoutByReference(
 	ctx context.Context,
 	reference string,
@@ -1521,7 +1531,59 @@ func (a *App) failPayoutByReference(
 		return err
 	}
 
-	if status == "SUCCESS" || status == "FAILED" || status == "REVERSED" {
+	switch payoutFailureAction(status, reason) {
+	case "NOOP":
+		return tx.Commit()
+	case "CREDIT_REVERSAL":
+		result, err := tx.ExecContext(
+			ctx,
+			`UPDATE wallets
+			 SET available_kobo = available_kobo + $1,
+			     updated_at = NOW()
+			 WHERE user_id = $2
+			   AND currency = 'NGN'`,
+			amount,
+			userID,
+		)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected != 1 {
+			return errors.New("wallet not found for successful payout reversal")
+		}
+
+		_, err = tx.ExecContext(
+			ctx,
+			`INSERT INTO ledger_entries
+				(id,user_id,kind,amount_kobo,reference,created_at)
+			 VALUES ($1,$2,'PAYOUT_REVERSAL',$3,$4,NOW())`,
+			uuid.NewString(),
+			userID,
+			amount,
+			reference,
+		)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.ExecContext(
+			ctx,
+			`UPDATE payouts
+			 SET status = 'REVERSED',
+			     provider_status = $1,
+			     failure_reason = $1,
+			     updated_at = NOW()
+			 WHERE reference = $2`,
+			reason,
+			reference,
+		)
+		if err != nil {
+			return err
+		}
 		return tx.Commit()
 	}
 
