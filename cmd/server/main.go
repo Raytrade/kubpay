@@ -1338,24 +1338,29 @@ func (a *App) paystackWebhook(c *gin.Context) {
 		return
 	}
 
+	var processingErr error
 	switch event.Event {
 	case "transfer.success":
-		if err := a.settleSuccessfulPayout(
+		processingErr = a.settleSuccessfulPayout(
 			c.Request.Context(),
 			event.Data.Reference,
 			rawBody,
-		); err != nil {
-			log.Printf("settlement error: %v", err)
-		}
+		)
 
 	case "transfer.failed", "transfer.reversed":
-		if err := a.failPayoutByReference(
+		processingErr = a.failPayoutByReference(
 			c.Request.Context(),
 			event.Data.Reference,
 			event.Event,
-		); err != nil {
-			log.Printf("payout failure processing error: %v", err)
-		}
+		)
+	}
+
+	if processingErr != nil {
+		log.Printf("Paystack webhook processing failed for %s (%s): %v", event.Event, event.Data.Reference, processingErr)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "webhook processing failed; provider may retry",
+		})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
