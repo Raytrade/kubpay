@@ -110,8 +110,8 @@ type PaystackTransferResponse struct {
 	Status  bool   `json:"status"`
 	Message string `json:"message"`
 	Data    struct {
-		Reference string `json:"reference"`
-		Status    string `json:"status"`
+		Reference    string `json:"reference"`
+		Status       string `json:"status"`
 		TransferCode string `json:"transfer_code"`
 	} `json:"data"`
 }
