@@ -156,6 +156,9 @@ func main() {
 	}
 
 	router := gin.Default()
+	if err := router.SetTrustedProxies(nil); err != nil {
+		log.Fatal("failed to configure trusted proxies: ", err)
+	}
 
 	// Root endpoint provides a useful response instead of Gin's default 404
 	// when someone opens the public service URL in a browser.
