@@ -157,6 +157,19 @@ func main() {
 
 	router := gin.Default()
 
+	// Root endpoint provides a useful response instead of Gin's default 404
+	// when someone opens the public service URL in a browser.
+	router.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"service": "KubPay API",
+			"status":  "online",
+			"health":  "/health",
+			"ready":   "/ready",
+			"api":     "/api/v1",
+			"note":    "Use the documented API endpoints; financial actions require authentication and applicable approval.",
+		})
+	})
+
 	router.GET("/health", app.health)
 	router.GET("/ready", app.ready)
 
