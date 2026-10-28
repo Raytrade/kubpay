@@ -29,13 +29,13 @@ import (
 )
 
 type Config struct {
-	Port                 string
-	DatabaseURL          string
-	JWTSecret            string
-	PaystackSecretKey    string
-	RequireApproval      bool
-	MaxTransferKobo      int64
-	DailyTransferKobo    int64
+	Port              string
+	DatabaseURL       string
+	JWTSecret         string
+	PaystackSecretKey string
+	RequireApproval   bool
+	MaxTransferKobo   int64
+	DailyTransferKobo int64
 }
 
 type App struct {
@@ -766,9 +766,9 @@ func (a *App) createPayout(c *gin.Context) {
 	}
 
 	response := gin.H{
-		"id":         payoutID,
-		"reference":  reference,
-		"status":     status,
+		"id":          payoutID,
+		"reference":   reference,
+		"status":      status,
 		"amount_kobo": req.AmountKobo,
 	}
 
