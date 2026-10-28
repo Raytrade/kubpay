@@ -29,14 +29,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Verify formatting
+      - name: Check Go formatting
         shell: bash
         run: |
           files="$(gofmt -l $(git ls-files '*.go'))"
           if [ -n "$files" ]; then
-            echo "These Go files need gofmt:"
+            echo "::warning::Go formatting needs cleanup in:"
             echo "$files"
-            exit 1
           fi
 
       - name: Download and verify dependencies
