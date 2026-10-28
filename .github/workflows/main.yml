@@ -21,10 +21,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: false
@@ -34,8 +34,9 @@ jobs:
         run: |
           files="$(gofmt -l $(git ls-files '*.go'))"
           if [ -n "$files" ]; then
-            echo "::warning::Go formatting needs cleanup in:"
+            echo "These Go files need gofmt:"
             echo "$files"
+            exit 1
           fi
 
       - name: Resolve and verify dependencies
