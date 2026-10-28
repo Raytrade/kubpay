@@ -54,6 +54,30 @@ func upperHex(value string) string {
 	return string(out)
 }
 
+func TestPayoutFailureActionHandlesReversalAfterSuccess(t *testing.T) {
+	tests := []struct {
+		name   string
+		status string
+		event  string
+		want   string
+	}{
+		{name: "successful payout reversed", status: "SUCCESS", event: "transfer.reversed", want: "CREDIT_REVERSAL"},
+		{name: "successful payout failure replay", status: "SUCCESS", event: "transfer.failed", want: "NOOP"},
+		{name: "duplicate reversal", status: "REVERSED", event: "transfer.reversed", want: "NOOP"},
+		{name: "duplicate failure", status: "FAILED", event: "transfer.failed", want: "NOOP"},
+		{name: "pending payout failure", status: "PROCESSING", event: "transfer.failed", want: "RELEASE_RESERVED"},
+		{name: "unknown payout reversal", status: "UNKNOWN", event: "transfer.reversed", want: "RELEASE_RESERVED"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := payoutFailureAction(tt.status, tt.event); got != tt.want {
+				t.Fatalf("payoutFailureAction(%q, %q) = %q, want %q", tt.status, tt.event, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestWebhookEventIDIsDeterministicAndPayloadSensitive(t *testing.T) {
 	body := []byte(`{"event":"transfer.success"}`)
 	first := webhookEventID("transfer.success", "KUB-1", body)
