@@ -173,6 +173,10 @@ func main() {
 		})
 	})
 
+	router.HEAD("/", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
 	router.GET("/health", app.health)
 	router.GET("/ready", app.ready)
 
