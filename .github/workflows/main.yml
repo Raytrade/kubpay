@@ -27,7 +27,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
 
       - name: Check Go formatting
         shell: bash
@@ -38,8 +38,10 @@ jobs:
             echo "$files"
           fi
 
-      - name: Download and verify dependencies
-        run: go mod download && go mod verify
+      - name: Resolve and verify dependencies
+        run: |
+          go mod tidy
+          go mod verify
 
       - name: Run tests
         run: go test ./...
